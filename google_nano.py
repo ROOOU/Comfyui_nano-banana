@@ -154,6 +154,7 @@ class GoogleNanoNode:
                 "site_url": ("STRING", {"multiline": False, "default": ""}),
                 "site_name": ("STRING", {"multiline": False, "default": ""}),
                 "model": ("STRING", {"multiline": False, "default": "google/gemini-2.5-flash-image-preview:free"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
                 "image1": ("IMAGE",),
                 "image2": ("IMAGE",),
                 "image3": ("IMAGE",),
@@ -224,6 +225,7 @@ class GoogleNanoNode:
         site_url: str = "",
         site_name: str = "",
         model: str = "google/gemini-2.5-flash-image-preview:free",
+        num_images: int = 1,
         image1=None,
         image2=None,
         image3=None,
@@ -256,12 +258,20 @@ class GoogleNanoNode:
 
         # 单条 prompt
         if prompt:
-            out_pils, err = self._call_openrouter(api_key, all_input_pils, prompt, site_url, site_name, model)
-            if err:
-                # 出错时返回原始输入图片
-                return (_pils_to_tensor(all_input_pils), err)
-            all_out_pils.extend(out_pils)
-            status_msgs.append(f"已生成 {len(out_pils)} 张图片。")
+            # 根据num_images生成多张图片
+            total_generated = 0
+            for i in range(num_images):
+                out_pils, err = self._call_openrouter(api_key, all_input_pils, prompt, site_url, site_name, model)
+                if err:
+                    # 如果是第一次生成就失败，返回原始输入图片
+                    if i == 0:
+                        return (_pils_to_tensor(all_input_pils), err)
+                    # 否则记录错误并继续
+                    status_msgs.append(f"第 {i+1} 张图片生成失败：{err}")
+                else:
+                    all_out_pils.extend(out_pils)
+                    total_generated += len(out_pils)
+            status_msgs.append(f"已生成 {total_generated} 张图片。")
 
         # 批量文件
         elif file_path:
