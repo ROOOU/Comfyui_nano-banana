@@ -1,7 +1,6 @@
 import os
 import io
 import base64
-import string
 import traceback
 from typing import List, Tuple
 
@@ -16,52 +15,15 @@ try:
 except Exception:
     HAS_PANDAS = False
 
+# Google AI SDK
 try:
-    from openai import OpenAI
+    from google import genai
+    from google.genai import types
+    HAS_GOOGLE_AI = True
 except Exception as e:
-    OpenAI = None  # 延迟报错，在调用时提示安装依赖
-
-
-def _pil_to_base64_data_url(img: Image.Image, format: str = "jpeg") -> str:
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format=format)
-    img_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/{format};base64,{img_str}"
-
-
-def _decode_image_from_openrouter_response(completion) -> Tuple[List[Image.Image], str]:
-    """
-    解析 OpenRouter chat.completions 响应中的 base64 图片，返回 PIL 列表或错误信息。
-    """
-    try:
-        response_dict = completion.model_dump()
-        images_list = response_dict.get("choices", [{}])[0].get("message", {}).get("images")
-        if images_list and isinstance(images_list, list) and len(images_list) > 0:
-            out_pils = []
-            for image_info in images_list:
-                base64_url = image_info.get("image_url", {}).get("url")
-                if not base64_url:
-                    continue
-                # 支持 data URL 或纯 base64
-                if "base64," in base64_url:
-                    base64_data = base64_url.split("base64,")[1]
-                else:
-                    base64_data = base64_url
-                img_bytes = base64.b64decode(base64_data)
-                pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                out_pils.append(pil)
-            if out_pils:
-                return out_pils, ""
-        # 未取到图片，回显原始 JSON
-        return [], f"模型回复中未直接包含图片数据。\n\n--- 完整的API回复 ---\n{completion.model_dump_json(indent=2)}"
-    except Exception as e:
-        try:
-            raw = completion.model_dump_json(indent=2)
-        except Exception:
-            raw = "<failed to dump json>"
-        return [], f"解析API响应时出错: {e}\n\n--- 完整的API回复 ---\n{raw}"
+    HAS_GOOGLE_AI = False
+    genai = None
+    types = None
 
 
 def _tensor_to_pils(image) -> List[Image.Image]:
@@ -82,7 +44,32 @@ def _tensor_to_pils(image) -> List[Image.Image]:
     return imgs
 
 
-def _pils_to_tensor(pils: List[Image.Image]) -> torch.Tensor:
+def _ensure_pil_image(img) -> Image.Image:
+    """
+    确保输入是一个有效的 PIL Image 对象
+    处理 google-genai 返回的 Image 类型
+    """
+    # 如果已经是 PIL Image，直接返回
+    if isinstance(img, Image.Image):
+        return img
+    
+    # 如果有 _pil_image 属性（google-genai 的 Image 类型）
+    if hasattr(img, '_pil_image'):
+        return img._pil_image
+    
+    # 如果有 data 属性，尝试从 bytes 创建
+    if hasattr(img, 'data'):
+        import io
+        return Image.open(io.BytesIO(img.data))
+    
+    # 尝试直接转换
+    try:
+        return Image.fromarray(np.array(img))
+    except Exception:
+        raise TypeError(f"无法转换为 PIL Image: {type(img)}")
+
+
+def _pils_to_tensor(pils: list) -> torch.Tensor:
     """
     将 PIL 列表转回 ComfyUI 的 IMAGE tensor[B,H,W,3], float32 0-1
     如果图片尺寸不一致，则分别处理每张图片，不强制统一尺寸
@@ -90,6 +77,9 @@ def _pils_to_tensor(pils: List[Image.Image]) -> torch.Tensor:
     if not pils:
         # 返回一个空的占位张量，避免下游崩溃（B=0）
         return torch.zeros((0, 64, 64, 3), dtype=torch.float32)
+    
+    # 确保所有图片都是 PIL Image
+    pils = [_ensure_pil_image(p) for p in pils]
     
     # 如果只有一张图片，直接处理
     if len(pils) == 1:
@@ -125,18 +115,21 @@ def _pils_to_tensor(pils: List[Image.Image]) -> torch.Tensor:
         return tensor.unsqueeze(0)  # [1,H,W,3]
 
 
-# 1. 修改类名，确保它在Python中是唯一的
 class GoogleNanoNode:
     """
-    使用 OpenRouter Chat Completions，通过单条 prompt 或 CSV/Excel 批量，根据输入参考图生成新图。
-    - 单图：提供 prompt
-    - 批量：提供 file_path（含 'prompt' 列）
+    Google Nano (Flash) 节点 - 使用 Gemini 2.5 Flash Image 模型
+    
+    特点：
+    - 快速生成
+    - 支持最多 8 张参考图像
+    - 适合高频率、低延迟任务
+    
     输出：
-      IMAGE: 生成的图像（单张或批量拼成 batch）
+      IMAGE: 生成的图像
       STRING: 状态/日志
     """
 
-    CATEGORY = "OpenRouter"
+    CATEGORY = "Google AI"
     FUNCTION = "generate"
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("image", "status")
@@ -151,9 +144,6 @@ class GoogleNanoNode:
             "optional": {
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "file_path": ("STRING", {"multiline": False, "default": ""}),
-                "site_url": ("STRING", {"multiline": False, "default": ""}),
-                "site_name": ("STRING", {"multiline": False, "default": ""}),
-                "model": ("STRING", {"multiline": False, "default": "google/gemini-2.5-flash-image-preview:free"}),
                 "num_images": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
                 "image1": ("IMAGE",),
                 "image2": ("IMAGE",),
@@ -166,54 +156,46 @@ class GoogleNanoNode:
             },
         }
 
-    def _call_openrouter(
+    def _call_google_ai(
         self,
         api_key: str,
         pil_refs: List[Image.Image],
         prompt_text: str,
-        site_url: str,
-        site_name: str,
-        model: str,
     ) -> Tuple[List[Image.Image], str]:
-        if OpenAI is None:
-            return [], "未安装 openai 库，请先安装：pip install openai"
+        if not HAS_GOOGLE_AI:
+            return [], "未安装 google-genai 库，请先安装：pip install google-genai"
         if not api_key:
-            return [], "错误：请输入 OpenRouter API Key。"
+            return [], "错误：请输入 Google AI API Key。"
 
         try:
-            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-            headers = {}
-            if site_url:
-                headers["HTTP-Referer"] = site_url
-            if site_name:
-                headers["X-Title"] = site_name
-
-            if len(pil_refs) > 1:
-                full_prompt = f"请严格根据这些图片，并结合以下提示词，生成一张新的图片。不要描述图片。提示词：'{prompt_text}'"
-            else:
-                full_prompt = f"请严格根据这张图片，并结合以下提示词，生成一张新的图片。不要描述图片。提示词：'{prompt_text}'"
-
-            content = [{"type": "text", "text": full_prompt}]
+            # 设置 API Key
+            client = genai.Client(api_key=api_key)
+            
+            # 构建内容
+            contents = [prompt_text]
             for pil_ref in pil_refs:
-                data_url = _pil_to_base64_data_url(pil_ref, format="jpeg")
-                content.append({"type": "image_url", "image_url": {"url": data_url}})
+                contents.append(pil_ref)
 
-            completion = client.chat.completions.create(
-                extra_headers=headers,
-                model=model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ],
+            # 调用 API
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-image",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_modalities=['TEXT', 'IMAGE']
+                )
             )
-            pils, err = _decode_image_from_openrouter_response(completion)
-            if err:
-                return [], err
-            if not pils:
+            
+            # 解析响应
+            out_pils = []
+            for part in response.parts:
+                if part.inline_data is not None:
+                    image = part.as_image()
+                    if image:
+                        out_pils.append(image)
+            
+            if not out_pils:
                 return [], "未从模型收到图片数据。"
-            return pils, ""
+            return out_pils, ""
         except Exception as e:
             return [], f"生成图片时出错: {traceback.format_exc()}"
 
@@ -222,9 +204,6 @@ class GoogleNanoNode:
         api_key: str,
         prompt: str = "",
         file_path: str = "",
-        site_url: str = "",
-        site_name: str = "",
-        model: str = "google/gemini-2.5-flash-image-preview:free",
         num_images: int = 1,
         image1=None,
         image2=None,
@@ -245,12 +224,9 @@ class GoogleNanoNode:
 
         if not all_input_pils:
             return (_pils_to_tensor([]), "错误：请输入至少一张参考图像。")
-        
-        # 不需要提前转换成tensor，直接使用PIL图片调用API
 
         # 判定模式
         if not prompt and not file_path:
-            # 如果没有操作，返回原始输入图片的tensor
             return (_pils_to_tensor(all_input_pils), "错误：请输入提示词或提供 CSV/Excel 文件路径。")
 
         all_out_pils: List[Image.Image] = []
@@ -258,15 +234,12 @@ class GoogleNanoNode:
 
         # 单条 prompt
         if prompt:
-            # 根据num_images生成多张图片
             total_generated = 0
             for i in range(num_images):
-                out_pils, err = self._call_openrouter(api_key, all_input_pils, prompt, site_url, site_name, model)
+                out_pils, err = self._call_google_ai(api_key, all_input_pils, prompt)
                 if err:
-                    # 如果是第一次生成就失败，返回原始输入图片
                     if i == 0:
                         return (_pils_to_tensor(all_input_pils), err)
-                    # 否则记录错误并继续
                     status_msgs.append(f"第 {i+1} 张图片生成失败：{err}")
                 else:
                     all_out_pils.extend(out_pils)
@@ -275,46 +248,35 @@ class GoogleNanoNode:
 
         # 批量文件
         elif file_path:
-            # 改进的路径处理，支持中文路径和带引号的路径
             clean_path = file_path.strip()
             
-            # 移除路径两端的引号（支持单引号和双引号）
             if (clean_path.startswith('"') and clean_path.endswith('"')) or \
                (clean_path.startswith("'") and clean_path.endswith("'")):
                 clean_path = clean_path[1:-1]
             
-            # 处理路径中的特殊字符，但保留中文字符
-            # 只移除不可打印的控制字符，保留中文等Unicode字符
             import re
-            # 移除控制字符但保留正常的Unicode字符（包括中文）
             clean_path = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', clean_path)
-            
-            # 标准化路径分隔符（Windows兼容性）
             clean_path = os.path.normpath(clean_path)
             
             if not os.path.exists(clean_path):
-                return (_pils_to_tensor(all_input_pils), f"错误：文件路径不存在: {clean_path}\n请检查路径是否正确，支持中文路径和带空格的路径。")
+                return (_pils_to_tensor(all_input_pils), f"错误：文件路径不存在: {clean_path}")
 
             if not HAS_PANDAS:
                 return (_pils_to_tensor(all_input_pils), "错误：批量模式需要 pandas，请先安装：pip install pandas openpyxl")
 
             try:
                 if clean_path.lower().endswith(".csv"):
-                    # 使用UTF-8编码读取CSV文件，支持中文
                     try:
                         df = pd.read_csv(clean_path, encoding='utf-8')
                     except UnicodeDecodeError:
-                        # 如果UTF-8失败，尝试GBK编码（中文Windows系统常用）
                         try:
                             df = pd.read_csv(clean_path, encoding='gbk')
                         except UnicodeDecodeError:
-                            # 最后尝试自动检测编码
                             df = pd.read_csv(clean_path, encoding='latin1')
                 else:
-                    # 读取Excel文件
                     df = pd.read_excel(clean_path, sheet_name="Sheet1")
             except Exception as e:
-                return (_pils_to_tensor(all_input_pils), f"读取文件失败：{e}\n请确认：\n1. 文件格式是否正确（CSV或Excel）\n2. 文件是否被其他程序占用\n3. 文件编码是否正确（建议UTF-8）")
+                return (_pils_to_tensor(all_input_pils), f"读取文件失败：{e}")
 
             if "prompt" not in df.columns:
                 return (_pils_to_tensor(all_input_pils), "错误：文件中未找到 'prompt' 列。")
@@ -324,7 +286,7 @@ class GoogleNanoNode:
                 if not isinstance(csv_prompt, str) or not csv_prompt.strip():
                     status_msgs.append(f"第 {idx + 1} 行跳过：空提示词")
                     continue
-                out_pils, err = self._call_openrouter(api_key, all_input_pils, csv_prompt, site_url, site_name, model)
+                out_pils, err = self._call_google_ai(api_key, all_input_pils, csv_prompt)
                 if err:
                     status_msgs.append(f"图片 {idx + 1} 生成失败：{err}")
                 else:
@@ -334,10 +296,262 @@ class GoogleNanoNode:
             if not all_out_pils:
                 return (_pils_to_tensor(all_input_pils), "未从文件中生成任何图片。\n" + "\n".join(status_msgs))
 
-        # 只在最后处理输出结果时才需要转换成tensor
         out_tensor = _pils_to_tensor(all_out_pils)
         
-        # 检查是否有多张不同尺寸的图片，如果有，添加说明
+        if len(all_out_pils) > 1:
+            sizes = [(pil.width, pil.height) for pil in all_out_pils]
+            unique_sizes = list(set(sizes))
+            if len(unique_sizes) > 1:
+                size_info = f"\n注意：生成了 {len(all_out_pils)} 张不同尺寸的图片 {unique_sizes}，ComfyUI只显示第一张。"
+                status = ("\n".join(status_msgs) + size_info) if status_msgs else ("完成" + size_info)
+            else:
+                status = "\n".join(status_msgs) if status_msgs else "完成"
+        else:
+            status = "\n".join(status_msgs) if status_msgs else "完成"
+            
+        return (out_tensor, status)
+
+
+class GoogleNanoProNode:
+    """
+    Nano Banana Pro 专用节点 - 使用 Gemini 3 Pro Image Preview 模型
+    
+    新功能：
+    - 支持最多 14 张参考图像（6 张物体 + 5 张人物 + 其他）
+    - 支持 1K/2K/4K 分辨率输出
+    - 支持多种宽高比设置
+    - 支持 Google Search Grounding（实时信息）
+    - 内置 Thinking 模式（自动优化构图）
+    
+    输出：
+      IMAGE: 生成的图像
+      STRING: 状态/日志
+    """
+
+    CATEGORY = "Google AI"
+    FUNCTION = "generate"
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "status")
+    OUTPUT_NODE = False
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"multiline": False, "default": ""}),
+            },
+            "optional": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "file_path": ("STRING", {"multiline": False, "default": ""}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                # 分辨率设置
+                "resolution": (["1K", "2K", "4K"], {"default": "1K"}),
+                # 宽高比设置
+                "aspect_ratio": (["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"], {"default": "1:1"}),
+                # Google Search Grounding
+                "enable_google_search": ("BOOLEAN", {"default": False}),
+                # 14 个图像输入
+                "image1": ("IMAGE",),
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+                "image4": ("IMAGE",),
+                "image5": ("IMAGE",),
+                "image6": ("IMAGE",),
+                "image7": ("IMAGE",),
+                "image8": ("IMAGE",),
+                "image9": ("IMAGE",),
+                "image10": ("IMAGE",),
+                "image11": ("IMAGE",),
+                "image12": ("IMAGE",),
+                "image13": ("IMAGE",),
+                "image14": ("IMAGE",),
+            },
+        }
+
+    def _call_google_ai_pro(
+        self,
+        api_key: str,
+        pil_refs: List[Image.Image],
+        prompt_text: str,
+        resolution: str,
+        aspect_ratio: str,
+        enable_google_search: bool,
+    ) -> Tuple[List[Image.Image], str]:
+        if not HAS_GOOGLE_AI:
+            return [], "未安装 google-genai 库，请先安装：pip install google-genai"
+        if not api_key:
+            return [], "错误：请输入 Google AI API Key。"
+
+        try:
+            # 设置 API Key
+            client = genai.Client(api_key=api_key)
+            
+            # 构建内容
+            contents = [prompt_text]
+            for pil_ref in pil_refs:
+                contents.append(pil_ref)
+
+            # 构建配置
+            config_params = {
+                "response_modalities": ['TEXT', 'IMAGE'],
+                "image_config": types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=resolution,
+                )
+            }
+            
+            # 添加 Google Search Grounding
+            if enable_google_search:
+                config_params["tools"] = [{"google_search": {}}]
+            
+            config = types.GenerateContentConfig(**config_params)
+
+            # 调用 API
+            response = client.models.generate_content(
+                model="gemini-3-pro-image-preview",
+                contents=contents,
+                config=config
+            )
+            
+            # 解析响应
+            out_pils = []
+            for part in response.parts:
+                if part.inline_data is not None:
+                    image = part.as_image()
+                    if image:
+                        out_pils.append(image)
+            
+            if not out_pils:
+                return [], "未从模型收到图片数据。"
+            return out_pils, ""
+        except Exception as e:
+            return [], f"生成图片时出错: {traceback.format_exc()}"
+
+    def generate(
+        self,
+        api_key: str,
+        prompt: str = "",
+        file_path: str = "",
+        num_images: int = 1,
+        resolution: str = "1K",
+        aspect_ratio: str = "1:1",
+        enable_google_search: bool = False,
+        image1=None,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
+        image6=None,
+        image7=None,
+        image8=None,
+        image9=None,
+        image10=None,
+        image11=None,
+        image12=None,
+        image13=None,
+        image14=None,
+    ):
+        all_input_pils: List[Image.Image] = []
+        try:
+            for img_tensor in [image1, image2, image3, image4, image5, image6, image7, 
+                               image8, image9, image10, image11, image12, image13, image14]:
+                if img_tensor is not None:
+                    all_input_pils.extend(_tensor_to_pils(img_tensor))
+        except Exception as e:
+            return (_pils_to_tensor([]), f"输入图像解析失败：{e}")
+
+        if not all_input_pils:
+            return (_pils_to_tensor([]), "错误：请输入至少一张参考图像。")
+        
+        # 检查图片数量限制
+        if len(all_input_pils) > 14:
+            return (_pils_to_tensor([]), f"错误：Nano Banana Pro 最多支持 14 张参考图像，当前输入 {len(all_input_pils)} 张。")
+
+        # 判定模式
+        if not prompt and not file_path:
+            return (_pils_to_tensor(all_input_pils), "错误：请输入提示词或提供 CSV/Excel 文件路径。")
+
+        all_out_pils: List[Image.Image] = []
+        status_msgs: List[str] = []
+        
+        # 添加配置信息到状态
+        config_info = f"[Nano Banana Pro] 分辨率: {resolution}, 宽高比: {aspect_ratio}"
+        if enable_google_search:
+            config_info += ", Google Search: 开启"
+        status_msgs.append(config_info)
+
+        # 单条 prompt
+        if prompt:
+            total_generated = 0
+            for i in range(num_images):
+                out_pils, err = self._call_google_ai_pro(
+                    api_key, all_input_pils, prompt,
+                    resolution, aspect_ratio, enable_google_search
+                )
+                if err:
+                    if i == 0:
+                        return (_pils_to_tensor(all_input_pils), err)
+                    status_msgs.append(f"第 {i+1} 张图片生成失败：{err}")
+                else:
+                    all_out_pils.extend(out_pils)
+                    total_generated += len(out_pils)
+            status_msgs.append(f"已生成 {total_generated} 张图片。")
+
+        # 批量文件
+        elif file_path:
+            clean_path = file_path.strip()
+            
+            if (clean_path.startswith('"') and clean_path.endswith('"')) or \
+               (clean_path.startswith("'") and clean_path.endswith("'")):
+                clean_path = clean_path[1:-1]
+            
+            import re
+            clean_path = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', clean_path)
+            clean_path = os.path.normpath(clean_path)
+            
+            if not os.path.exists(clean_path):
+                return (_pils_to_tensor(all_input_pils), f"错误：文件路径不存在: {clean_path}")
+
+            if not HAS_PANDAS:
+                return (_pils_to_tensor(all_input_pils), "错误：批量模式需要 pandas，请先安装：pip install pandas openpyxl")
+
+            try:
+                if clean_path.lower().endswith(".csv"):
+                    try:
+                        df = pd.read_csv(clean_path, encoding='utf-8')
+                    except UnicodeDecodeError:
+                        try:
+                            df = pd.read_csv(clean_path, encoding='gbk')
+                        except UnicodeDecodeError:
+                            df = pd.read_csv(clean_path, encoding='latin1')
+                else:
+                    df = pd.read_excel(clean_path, sheet_name="Sheet1")
+            except Exception as e:
+                return (_pils_to_tensor(all_input_pils), f"读取文件失败：{e}")
+
+            if "prompt" not in df.columns:
+                return (_pils_to_tensor(all_input_pils), "错误：文件中未找到 'prompt' 列。")
+
+            for idx, row in df.iterrows():
+                csv_prompt = row.get("prompt")
+                if not isinstance(csv_prompt, str) or not csv_prompt.strip():
+                    status_msgs.append(f"第 {idx + 1} 行跳过：空提示词")
+                    continue
+                out_pils, err = self._call_google_ai_pro(
+                    api_key, all_input_pils, csv_prompt,
+                    resolution, aspect_ratio, enable_google_search
+                )
+                if err:
+                    status_msgs.append(f"图片 {idx + 1} 生成失败：{err}")
+                else:
+                    all_out_pils.extend(out_pils)
+                    status_msgs.append(f"图片 {idx + 1} 生成成功（{len(out_pils)} 张）。")
+
+            if not all_out_pils:
+                return (_pils_to_tensor(all_input_pils), "未从文件中生成任何图片。\n" + "\n".join(status_msgs))
+
+        out_tensor = _pils_to_tensor(all_out_pils)
+        
         if len(all_out_pils) > 1:
             sizes = [(pil.width, pil.height) for pil in all_out_pils]
             unique_sizes = list(set(sizes))
@@ -353,11 +567,11 @@ class GoogleNanoNode:
 
 
 # 注册到 ComfyUI
-# 2. 修改节点类映射，使用新的类名作为键和值
 NODE_CLASS_MAPPINGS = {
     "GoogleNanoNode": GoogleNanoNode,
+    "GoogleNanoProNode": GoogleNanoProNode,
 }
-# 3. 修改节点显示名称映射，使用新的类名作为键
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "GoogleNanoNode": "google nano",
+    "GoogleNanoNode": "Google Nano (Flash)",
+    "GoogleNanoProNode": "Google Nano Pro",
 }
